@@ -16,7 +16,7 @@
 
 using namespace mt;
 
-static bool flatPay;
+static bool flatPay, stackAll;
 
 static DWORD WINAPI run(LPVOID) {
     MT_LOG("Capitalist Economy loaded: pay by straight line, weight, size and fragility");
@@ -63,9 +63,13 @@ static DWORD WINAPI run(LPVOID) {
             }
             if (rs < 0 || objName(st) != "CargoRow") continue;  // any table of cargo rows: mods name theirs anything
             int rSqrt = flatPay ? off(st, "PaymentSqrtRatio") : -1;
+            // Written whole, so only when it has its byte to itself and is no bitfield.
+            int rStack = off(st, "bAllowStacking");
+            if (rStack == off(st, "bUseDamage")) { MT_LOG("bAllowStacking is a bitfield here -- stacking left as it is"); rStack = -1; }
+            if (!stackAll) rStack = -1;
             int rPer = off(st, "PaymentPer1Km"), rFrag = off(st, "Fragile"), rFlags = off(st, "CargoFlags");
             uintptr_t el = get<uintptr_t>(t + rs + 8); int num = get<int>(t + rs + 16);
-            int got = 0, flat = 0;
+            int got = 0, flat = 0, stacked = 0;
             for (int j = 0; j < num && j < 4096; j++) {  // TSetElement: FName, uint8*, hash links = 24 bytes
                 uint32_t key = get<uint32_t>(el + 24ull * j); uintptr_t row = get<uintptr_t>(el + 24ull * j + 8);
                 if (!row || name(key).empty()) continue;  // free slot
@@ -77,8 +81,10 @@ static DWORD WINAPI run(LPVOID) {
                 // it off, as vanilla's one-off loads (transformers, the big tank) already do.
                 float zero = 0;
                 if (rSqrt >= 0 && get<float>(row + rSqrt) != 0) { wr(row + rSqrt, &zero, 4); flat++; }
+                uint8_t yes = 1;
+                if (rStack >= 0 && !get<uint8_t>(row + rStack)) { wr(row + rStack, &yes, 1); stacked++; }
             }
-            MT_LOG("table %s: %d rows, volume discount off on %d (struct %s, perKm+%x fragile+%x flags+%x)", objName(t).c_str(), got, flat, objName(st).c_str(), rPer, rFrag, rFlags);
+            MT_LOG("table %s: %d rows, volume discount off on %d, stacking on for %d (struct %s, perKm+%x fragile+%x flags+%x)", objName(t).c_str(), got, flat, stacked, objName(st).c_str(), rPer, rFrag, rFlags);
         }
     };
 
@@ -86,7 +92,8 @@ static DWORD WINAPI run(LPVOID) {
     struct { const wchar_t* key; double v; } cfg[] = {
         { L"CurveAt1t", 435 }, { L"CurveExponent", 0.6 }, { L"DimKgPerM3", 250 },
         { L"OversizeBonus", 1.5 }, { L"NudgeMin", 0.85 }, { L"NudgeMax", 1.3 },
-        { L"RoadShare", 0.5 }, { L"Enabled", 1 }, { L"FlatPay", 1 } };
+        { L"RoadShare", 0.5 }, { L"Enabled", 1 }, { L"FlatPay", 1 }, { L"StackAll", 1 },
+        { L"RoadSpeed", 80 }, { L"OffroadSpeed", 40 }, { L"OffroadBonus", 1.5 } };
       for (auto& c : cfg) {
           c.v = iniNum(L"capitalist_economy.ini", L"Pay", c.key, c.v);
           MT_LOG("setting %ls = %g", c.key, c.v);
@@ -94,9 +101,16 @@ static DWORD WINAPI run(LPVOID) {
     double kA = cfg[0].v, kE = cfg[1].v, kDim = cfg[2].v, kOver = cfg[3].v, kNMin = cfg[4].v, kNMax = cfg[5].v, kRoadShare = cfg[6].v;
     bool enabled = cfg[7].v != 0 && jobsOk;
     flatPay = cfg[8].v != 0;
+    stackAll = cfg[9].v != 0;
+    double kRoad = cfg[10].v, kOffroad = cfg[11].v, kBonus = cfg[12].v;
     auto clampd = [](double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; };
 
     std::unordered_map<uintptr_t, int64_t> wrote;  // cargo -> base we wrote
+    std::unordered_map<int, int> jobLogged;        // job id -> cargos it had when logged
+    int dKey = off(delStruct, "CargoKey"), dNum = off(delStruct, "NumCargos"), dWeight = off(delStruct, "Weight"),
+        dDemand = off(delStruct, "PaymentMultiplierByDemand"), dSupply = off(delStruct, "PaymentMultiplierBySupply"),
+        dConfig = off(delStruct, "PaymentMultiplierByBalanceConfig"), dClimb = off(delStruct, "PathClimbHeight"), dPace = off(delStruct, "PathSpeedKPH"),
+        dCargos = off(delStruct, "Server_Cargos");
     for (;;) {
         Sleep(1000);
         if (!enabled) continue;
@@ -105,12 +119,27 @@ static DWORD WINAPI run(LPVOID) {
             uintptr_t o = api->object(i);
             if (o && !isCDO(o) && classOf(o) == sysCls) sys = o;
         }
+        // Before the world too: what the game takes at load has to be changed by then.
+        if (!sys || rows.empty()) loadRows();
         if (!sys) continue;
-        if (rows.empty()) loadRows();
-        std::unordered_map<int, float> road;  // job id -> PathDistance
+        std::unordered_map<int, float> road, pace;  // job id -> PathDistance, PathSpeedKPH
         uintptr_t data = get<uintptr_t>(sys + oDeliveries); int num = get<int>(sys + oDeliveries + 8);
         for (int j = 0; j < num && j < 100000; j++)
-            road[get<int>(data + (uintptr_t)j * dSize + dId)] = get<float>(data + (uintptr_t)j * dSize + dPath);
+        {
+            uintptr_t d = data + (uintptr_t)j * dSize;
+            int id = get<int>(d + dId), have = get<int>(d + dCargos + 8);
+            road[id] = get<float>(d + dPath);
+            pace[id] = dPace >= 0 ? get<float>(d + dPace) : 0;
+            // What each open job is worth, for tuning pay against real numbers.
+            auto seen = jobLogged.find(id);
+            if (seen != jobLogged.end() && seen->second >= (have ? 1 : 0)) continue;
+            jobLogged[id] = have ? 1 : 0;
+            int64_t single = 0;
+            if (have) single = get<int64_t>(get<uintptr_t>(get<uintptr_t>(d + dCargos)) + oOne);
+            MT_LOG("job %s road %.0f kph %.0f climb %.0f units %d weight %.0f demand %.2f supply %.2f config %.2f unit pay %lld",
+                   fname(d + dKey).c_str(), road[id], pace[id], get<float>(d + dClimb), get<int>(d + dNum), get<float>(d + dWeight),
+                   get<float>(d + dDemand), get<float>(d + dSupply), get<float>(d + dConfig), single);
+        }
 
         for (int i = 0, n = api->num_objects(); i < n; i++) {
             uintptr_t o = api->object(i);
@@ -133,6 +162,12 @@ static DWORD WINAPI run(LPVOID) {
             double r = lineCm / job->second;
             if (r > 20) r /= 100;  // PathDistance in metres rather than cm
             double fd = kRoadShare + (1.0 - kRoadShare) * r;
+            // A slow route is off-road: it winds because the ground does, so it loses the
+            // straight-line cut and earns a bonus, both by how slow it is. Speed is the game's own.
+            double kph = pace[job->first], span = kRoad - kOffroad;
+            double rough = kph > 0 && span > 0 ? clampd((kRoad - kph) / span, 0, 1) : 0;
+            if (fd < 1) fd += (1 - fd) * rough;
+            fd *= 1 + (kBonus - 1) * rough;
 
             // weight, size, fragility: nudge vanilla's rate toward a freight curve
             uint32_t key = get<uint32_t>(o + oKey);
@@ -158,8 +193,8 @@ static DWORD WINAPI run(LPVOID) {
             int64_t outPay[2] = { np, pay[0] + pay[1] - np }, outOne[2] = { no, one[0] + one[1] - no };
             if (!wr(o + oPay, outPay, 16) || !wr(o + oOne, outOne, 16)) continue;
             wrote[o] = np;
-            MT_LOG("%s %-22s job %6d  line %6.2f km  road %7.0f  ratio %.2f  distance x%.2f | %7.1f kg %6.2f m3 row %s  size x%.2f | pay %lld -> %lld",
-                   again ? "REPRICED" : "priced", name(key).c_str(), job->first, lineCm / 100000.0, job->second, r, fd,
+            MT_LOG("%s %-22s job %6d  line %6.2f km  road %7.0f  ratio %.2f  kph %.0f  distance x%.2f | %7.1f kg %6.2f m3 row %s  size x%.2f | pay %lld -> %lld",
+                   again ? "REPRICED" : "priced", name(key).c_str(), job->first, lineCm / 100000.0, job->second, r, kph, fd,
                    kg, m3, row != rows.end() ? "yes" : "NO", fn, pay[0], np);
         }
     }
