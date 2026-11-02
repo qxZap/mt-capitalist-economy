@@ -114,20 +114,26 @@ static DWORD WINAPI run(LPVOID) {
     for (;;) {
         Sleep(1000);
         if (!enabled) continue;
-        uintptr_t sys = 0;
-        for (int i = 0, n = api->num_objects(); i < n && !sys; i++) {
-            uintptr_t o = api->object(i);
-            if (o && !isCDO(o) && classOf(o) == sysCls) sys = o;
+        static int sysAt = -1;  // the object walk is the costly part: only when the world changed
+        uintptr_t sys = sysAt >= 0 ? api->object(sysAt) : 0;
+        if (!sys || isCDO(sys) || classOf(sys) != sysCls) {
+            sys = 0;
+            for (int i = 0, n = api->num_objects(); i < n && !sys; i++) {
+                uintptr_t o = api->object(i);
+                if (o && !isCDO(o) && classOf(o) == sysCls) { sys = o; sysAt = i; }
+            }
         }
         // Before the world too: what the game takes at load has to be changed by then.
         if (!sys || rows.empty()) loadRows();
         if (!sys) continue;
         std::unordered_map<int, float> road, pace;  // job id -> PathDistance, PathSpeedKPH
+        bool loaded = false;
         uintptr_t data = get<uintptr_t>(sys + oDeliveries); int num = get<int>(sys + oDeliveries + 8);
         for (int j = 0; j < num && j < 100000; j++)
         {
             uintptr_t d = data + (uintptr_t)j * dSize;
             int id = get<int>(d + dId), have = get<int>(d + dCargos + 8);
+            loaded = loaded || have > 0;
             road[id] = get<float>(d + dPath);
             pace[id] = dPace >= 0 ? get<float>(d + dPace) : 0;
             // What each open job is worth, for tuning pay against real numbers.
@@ -141,7 +147,7 @@ static DWORD WINAPI run(LPVOID) {
                    get<float>(d + dDemand), get<float>(d + dSupply), get<float>(d + dConfig), single);
         }
 
-        for (int i = 0, n = api->num_objects(); i < n; i++) {
+        for (int i = 0, n = loaded ? api->num_objects() : 0; i < n; i++) {
             uintptr_t o = api->object(i);
             if (!o || isCDO(o)) continue;
             if (!api->is_a(classOf(o), cargo)) continue;
