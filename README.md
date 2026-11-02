@@ -6,7 +6,7 @@ Paid distance is the average of the road and the full straight line between pick
 
 Slow routes are treated as off-road, going by the game's own route speed: between `RoadSpeed` (80 km/h) and `OffroadSpeed` (40 km/h) they lose the straight-line cut and gain up to `OffroadBonus` (1.5x). On a server this applies on the machine running the game.
 
-Settings: `Binaries\Win64\capitalist_economy.ini`. On a dedicated server it must be installed on the server too.
+Settings: `Binaries\Win64\plugins\capitalist_economy.ini`. On a dedicated server it must be installed on the server too.
 
 ## Install
 
