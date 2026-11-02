@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/hero.png" alt="Capitalist Economy" width="100%">
+</p>
+
 # Capitalist Economy
 
 Cargo pay by straight-line distance, weight, size and fragility.
