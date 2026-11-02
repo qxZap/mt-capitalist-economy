@@ -16,6 +16,8 @@
 
 using namespace mt;
 
+static bool flatPay;
+
 static DWORD WINAPI run(LPVOID) {
     MT_LOG("Capitalist Economy loaded: pay by straight line, weight, size and fragility");
     if (!api->wait_engine(INFINITE)) { MT_LOG("FAILED: loader found no engine -- pay stays vanilla"); return 0; }
@@ -50,18 +52,20 @@ static DWORD WINAPI run(LPVOID) {
     auto loadRows = [&]() {
         for (int i = 0, n = api->num_objects(); i < n; i++) {
             uintptr_t t = api->object(i);
-            if (!t || isCDO(t) || objName(classOf(t)) != "DataTable") continue;
-            if (objName(t).rfind("Cargos", 0) != 0) continue;
+            if (!t || isCDO(t)) continue;
+            std::string cn = objName(classOf(t));
+            if (cn != "DataTable" && cn != "CompositeDataTable") continue;
             // RowStruct: first pointer to a ScriptStruct; RowMap (TMap<FName, uint8*>) right after it
             int rs = -1; uintptr_t st = 0;
             for (int x = 0x28; x <= 0x48 && rs < 0; x += 8) {
                 uintptr_t q = get<uintptr_t>(t + x);
                 if (q && objName(classOf(q)) == "ScriptStruct") { rs = x; st = q; }
             }
-            if (rs < 0) continue;
+            if (rs < 0 || objName(st) != "CargoRow") continue;  // any table of cargo rows: mods name theirs anything
+            int rSqrt = flatPay ? off(st, "PaymentSqrtRatio") : -1;
             int rPer = off(st, "PaymentPer1Km"), rFrag = off(st, "Fragile"), rFlags = off(st, "CargoFlags");
             uintptr_t el = get<uintptr_t>(t + rs + 8); int num = get<int>(t + rs + 16);
-            int got = 0;
+            int got = 0, flat = 0;
             for (int j = 0; j < num && j < 4096; j++) {  // TSetElement: FName, uint8*, hash links = 24 bytes
                 uint32_t key = get<uint32_t>(el + 24ull * j); uintptr_t row = get<uintptr_t>(el + 24ull * j + 8);
                 if (!row || name(key).empty()) continue;  // free slot
@@ -69,24 +73,27 @@ static DWORD WINAPI run(LPVOID) {
                 r.flags = rFlags >= 0 ? get<int>(row + rFlags) : 0;
                 if (r.perKm < 0 || r.perKm > 1e6) continue;
                 rows[key] = r; got++;
+                // the volume discount: the more a load holds, the less each unit pays. 0 turns
+                // it off, as vanilla's one-off loads (transformers, the big tank) already do.
+                float zero = 0;
+                if (rSqrt >= 0 && get<float>(row + rSqrt) != 0) { wr(row + rSqrt, &zero, 4); flat++; }
             }
-            MT_LOG("table %s: %d rows (struct %s, perKm+%x fragile+%x flags+%x)", objName(t).c_str(), got, objName(st).c_str(), rPer, rFrag, rFlags);
+            MT_LOG("table %s: %d rows, volume discount off on %d (struct %s, perKm+%x fragile+%x flags+%x)", objName(t).c_str(), got, flat, objName(st).c_str(), rPer, rFrag, rFlags);
         }
     };
 
     // ---- settings: capitalist_economy.ini in Binaries\Win64, written with defaults if absent ----
     struct { const wchar_t* key; double v; } cfg[] = {
-        { L"DistanceRate", 1.4 }, { L"DistanceMin", 0.5 }, { L"DistanceMax", 1.3 },
         { L"CurveAt1t", 435 }, { L"CurveExponent", 0.6 }, { L"DimKgPerM3", 250 },
         { L"OversizeBonus", 1.5 }, { L"NudgeMin", 0.85 }, { L"NudgeMax", 1.3 },
-        { L"RoadShare", 0.5 }, { L"Enabled", 1 } };
+        { L"RoadShare", 0.5 }, { L"Enabled", 1 }, { L"FlatPay", 1 } };
       for (auto& c : cfg) {
           c.v = iniNum(L"capitalist_economy.ini", L"Pay", c.key, c.v);
           MT_LOG("setting %ls = %g", c.key, c.v);
       }
-    double kRate = cfg[0].v, kDMin = cfg[1].v, kDMax = cfg[2].v, kA = cfg[3].v, kE = cfg[4].v, kDim = cfg[5].v,
-           kOver = cfg[6].v, kNMin = cfg[7].v, kNMax = cfg[8].v, kRoadShare = cfg[9].v;
-    bool enabled = cfg[10].v != 0 && jobsOk;
+    double kA = cfg[0].v, kE = cfg[1].v, kDim = cfg[2].v, kOver = cfg[3].v, kNMin = cfg[4].v, kNMax = cfg[5].v, kRoadShare = cfg[6].v;
+    bool enabled = cfg[7].v != 0 && jobsOk;
+    flatPay = cfg[8].v != 0;
     auto clampd = [](double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; };
 
     std::unordered_map<uintptr_t, int64_t> wrote;  // cargo -> base we wrote
@@ -117,18 +124,15 @@ static DWORD WINAPI run(LPVOID) {
             auto job = road.find(get<int>(o + oId));
             if (pay[0] <= 0 || job == road.end() || job->second <= 0) continue;  // not on a job: leave it
 
-            // distance factor: blend the road the game priced with the straight
-            // line between pickup and drop. RoadShare of it stays on vanilla's
-            // road-based pay (factor 1), so a long off-road haul with a short
-            // straight line keeps its reward; the rest rides the straight line,
-            // so an easy near-straight detour cannot be milked. The straight
-            // line is 3D -- dz is the climb, so a mountain haul is paid for it.
+            // paid distance = RoadShare of the road the game priced + the rest of
+            // the full straight line between pickup and drop. The weights add up to
+            // one, so with 0.5 this is plainly the average of the two distances. The
+            // straight line is 3D -- dz is the climb, so a mountain haul is paid for it.
             double dx = dst[0]-src[0], dy = dst[1]-src[1], dz = dst[2]-src[2];
             double lineCm = sqrt(dx*dx + dy*dy + dz*dz);
             double r = lineCm / job->second;
             if (r > 20) r /= 100;  // PathDistance in metres rather than cm
-            double straight = clampd(r * kRate, kDMin, kDMax);
-            double fd = kRoadShare + (1.0 - kRoadShare) * straight;
+            double fd = kRoadShare + (1.0 - kRoadShare) * r;
 
             // weight, size, fragility: nudge vanilla's rate toward a freight curve
             uint32_t key = get<uint32_t>(o + oKey);
@@ -154,8 +158,8 @@ static DWORD WINAPI run(LPVOID) {
             int64_t outPay[2] = { np, pay[0] + pay[1] - np }, outOne[2] = { no, one[0] + one[1] - no };
             if (!wr(o + oPay, outPay, 16) || !wr(o + oOne, outOne, 16)) continue;
             wrote[o] = np;
-            MT_LOG("%s %-22s job %6d  line %6.2f km  road %7.0f  ratio %.2f  straight x%.2f blend x%.2f | %7.1f kg %6.2f m3 row %s  size x%.2f | pay %lld -> %lld",
-                   again ? "REPRICED" : "priced", name(key).c_str(), job->first, lineCm / 100000.0, job->second, r, straight, fd,
+            MT_LOG("%s %-22s job %6d  line %6.2f km  road %7.0f  ratio %.2f  distance x%.2f | %7.1f kg %6.2f m3 row %s  size x%.2f | pay %lld -> %lld",
+                   again ? "REPRICED" : "priced", name(key).c_str(), job->first, lineCm / 100000.0, job->second, r, fd,
                    kg, m3, row != rows.end() ? "yes" : "NO", fn, pay[0], np);
         }
     }
