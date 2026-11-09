@@ -8,6 +8,13 @@
 //
 // Recomputes every live cargo's Net_Payment from the cargo's real weight, its
 // size and the straight-line distance between pickup and drop-off.
+//
+// On a dedicated server it also sets the economy's console variables (AI driver share, depot use,
+// patrol pay..), the [Cvars] section of the ini. They go into Config\UserEngine.ini before the
+// engine reads it, which only takes for the few that are not cheat variables, and are then
+// written in memory once the world is up (see findCvars) and read back to check.
+// shortcut: server only. A client's copy would count as a console variable mismatch on a vanilla
+// server and MTNet rewrites that file whole. Merge there if single player needs them too.
 
 #include <cmath>
 #include <cstdint>
@@ -17,6 +24,113 @@
 using namespace mt;
 
 static bool flatPay, stackAll;
+
+struct Cvar { const wchar_t* key; double v; };
+static Cvar cvars[] = {
+    // The template's policePatrolPointPayment / AreaPayment are now ...Base, beside a per-hour rate
+    // (vanilla 300 + 10000/h, 2000 + 20000/h). Its policePatrolPayment has no successor.
+    {L"mh.requestRewardsPeriodSeconds", 600}, {L"mh.policePatrolPointPaymentBase", 2000},
+    {L"mh.policePatrolAreaPaymentBase", 5000}, {L"mh.refuelEVMinPercentPerSeconds", 0.1}, {L"mh.companyTruckProfitShare", 0.7},
+    {L"mh.busCompanyProfitShare", 0.7}, {L"mh.policeSpikePadDeploySeconds", 1}, {L"mh.policePatrolPointsPerArea", 20},
+    {L"mh.policePatrolPointsPerAreaMin", 6}, {L"mh.policePatrolAreaPerZoneMultiplierByPopulation", 4},
+    {L"mh.companyDepotStorageUsagePerService", 0.01}, {L"mh.aISpeederSpawnRatio", 400}, {L"mh.invalidPartsDisableEngine", 0},
+    {L"mh.invalidPartsDisableLeaderboard", 0}, {L"mh.invalidPartsLifespan", 0}, {L"mh.cargoStackMaxVehicleHeight", 840}};
+static bool onServer;
+static uintptr_t systemCDO, fRead;
+
+static bool isDedicated() {
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    return wcsstr(exe, L"MotorTownServer") != nullptr;
+}
+
+static void writeCvars() {
+    std::wstring dir = gameDir() + L"..\\..\\Config";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring path = dir + L"\\UserEngine.ini";
+    for (Cvar& c : cvars) {
+        c.v = iniNum(L"capitalist_economy.ini", L"Cvars", c.key, c.v);
+        wchar_t text[32];
+        swprintf_s(text, L"%g", c.v);
+        WritePrivateProfileStringW(L"ConsoleVariables", c.key, text, path.c_str());
+    }
+}
+
+static float readCvar(const wchar_t* key) {
+    struct { const wchar_t* data; int num, max; } in = {key, (int)wcslen(key) + 1, (int)wcslen(key) + 1};
+    unsigned char p[0x40] = {0};
+    memcpy(p + off(fRead, "VariableName"), &in, sizeof in);
+    api->process_event(systemCDO, fRead, p);
+    float out = 0;
+    memcpy(&out, p + off(fRead, "ReturnValue"), 4);
+    return out;
+}
+
+// Most of these are ECVF_Cheat, which a shipping build will not set from the console or an ini,
+// so their values are written where the variable keeps them. Each TAutoConsoleVariable is built
+// by `lea rdx, name ... call [rax+10h or 18h]` (RegisterConsoleVariable, float or int), then the
+// result goes to the global: `mov rdx, rax; lea rcx, global; call` or `mov [global+8], rax`.
+// The global holds the variable at +8 and its TConsoleVariableData (the game and render thread
+// copies) at +10h. Anything that does not read back as the game's own value is left alone.
+struct Site { uintptr_t data; bool isInt; };
+static std::unordered_map<std::wstring, Site> findCvars() {
+    std::unordered_map<std::wstring, Site> out;
+    auto base = (const uint8_t*)api->module_base();
+    auto nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const uint8_t *text = nullptr, *rdata = nullptr;
+    size_t textN = 0, rdataN = 0;
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int s = 0; s < nt->FileHeader.NumberOfSections; s++, sec++) {
+        if (!memcmp(sec->Name, ".text", 6)) { text = base + sec->VirtualAddress; textN = sec->Misc.VirtualSize; }
+        if (!memcmp(sec->Name, ".rdata", 7)) { rdata = base + sec->VirtualAddress; rdataN = sec->Misc.VirtualSize; }
+    }
+    if (!text || !rdata) return out;
+    std::unordered_map<uintptr_t, const wchar_t*> names;
+    for (Cvar& c : cvars) {
+        size_t n = (wcslen(c.key) + 1) * 2;
+        for (size_t i = 0; i + n <= rdataN; i += 2)
+            if (!memcmp(rdata + i, c.key, n)) { names[(uintptr_t)(rdata + i)] = c.key; break; }
+    }
+    auto rip = [](const uint8_t* at, int len) { return (uintptr_t)(at + len) + *(const int32_t*)(at + len - 4); };
+    for (size_t i = 0; i + 0x60 < textN; i++) {
+        const uint8_t* p = text + i;
+        if (p[0] != 0x48 || p[1] != 0x8D || p[2] != 0x15) continue;  // lea rdx, [rip+x]
+        auto hit = names.find(rip(p, 7));
+        if (hit == names.end()) continue;
+        const uint8_t* call = nullptr;
+        for (int k = 7; k < 0x30 && !call; k++)
+            if (p[k] == 0xFF && p[k + 1] == 0x50 && (p[k + 2] == 0x10 || p[k + 2] == 0x18)) call = p + k;
+        if (!call) continue;
+        const uint8_t* q = call + 3;
+        uintptr_t global = 0;
+        if (!memcmp(q, "\x48\x8B\xD0\x48\x8D\x0D", 6)) global = rip(q + 3, 7);
+        else for (int k = 0; k < 0x20 && !global; k++)
+            if (q[k] == 0x48 && q[k + 1] == 0x89 && q[k + 2] == 0x05) global = rip(q + k, 7) - 8;
+        uintptr_t data = global ? get<uintptr_t>(global + 0x10) : 0;
+        if (data) out[hit->second] = {data, call[2] == 0x18};
+    }
+    return out;
+}
+
+static void checkCvars(void*) {
+    auto sites = findCvars();
+    int wrong = 0;
+    for (Cvar& c : cvars) {
+        float now = readCvar(c.key);
+        auto s = sites.find(c.key);
+        if (fabs(now - c.v) >= 1e-4 && s != sites.end()) {
+            bool same = s->second.isInt ? get<int32_t>(s->second.data) == (int32_t)now : get<float>(s->second.data) == now;
+            if (!same) MT_LOG("cvar %ls: its data does not read %g, left alone", c.key, now);
+            else if (s->second.isInt) { int32_t v[2] = {(int32_t)llround(c.v), (int32_t)llround(c.v)}; wr(s->second.data, v, 8); }
+            else { float v[2] = {(float)c.v, (float)c.v}; wr(s->second.data, v, 8); }
+        }
+        float out = readCvar(c.key);
+        if (fabs(out - c.v) < 1e-4) continue;
+        wrong++;
+        MT_LOG("cvar %ls is %g, wanted %g%s", c.key, out, c.v, s == sites.end() ? " (not a registered variable here)" : "");
+    }
+    MT_LOG("console variables: %d of %d took, %d found in the exe", (int)(sizeof cvars / sizeof *cvars) - wrong, (int)(sizeof cvars / sizeof *cvars), (int)sites.size());
+}
 
 static DWORD WINAPI run(LPVOID) {
     MT_LOG("Capitalist Economy loaded: pay by straight line, weight, size and fragility");
@@ -98,6 +212,8 @@ static DWORD WINAPI run(LPVOID) {
           c.v = iniNum(L"capitalist_economy.ini", L"Pay", c.key, c.v);
           MT_LOG("setting %ls = %g", c.key, c.v);
       }
+    systemCDO = api->find_object("KismetSystemLibrary", "Default__KismetSystemLibrary", "/Script/Engine");
+    fRead = api->find_object("Function", "GetConsoleVariableFloatValue", "KismetSystemLibrary");
     double kA = cfg[0].v, kE = cfg[1].v, kDim = cfg[2].v, kOver = cfg[3].v, kNMin = cfg[4].v, kNMax = cfg[5].v, kRoadShare = cfg[6].v;
     bool enabled = cfg[7].v != 0 && jobsOk;
     flatPay = cfg[8].v != 0;
@@ -126,6 +242,11 @@ static DWORD WINAPI run(LPVOID) {
         // Before the world too: what the game takes at load has to be changed by then.
         if (!sys || rows.empty()) loadRows();
         if (!sys) continue;
+        static int checked;
+        if (onServer && checked >= 0 && ++checked > 90 && systemCDO && fRead && api->game_thread_ready()) {
+            checked = -1;
+            api->run_on_game_thread(checkCvars, nullptr);
+        }
         std::unordered_map<int, float> road, pace;  // job id -> PathDistance, PathSpeedKPH
         bool loaded = false;
         uintptr_t data = get<uintptr_t>(sys + oDeliveries); int num = get<int>(sys + oDeliveries + 8);
@@ -209,6 +330,8 @@ static DWORD WINAPI run(LPVOID) {
 extern "C" __declspec(dllexport) int PluginInit(const MtApi* a) {
     if (!attach(a)) return 1;
     if (iniDisabled(L"capitalist_economy.ini")) return 0;
+    onServer = isDedicated();
+    if (onServer) writeCvars();
     CloseHandle(CreateThread(nullptr, 0, run, nullptr, 0, nullptr));
     return 0;
 }
