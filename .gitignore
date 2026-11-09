@@ -2,3 +2,6 @@ out/
 *.obj
 *.exp
 *.lib
+*.pak
+mod/qxZap_CapitalistEconomy_P/
+__pycache__/
